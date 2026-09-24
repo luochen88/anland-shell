@@ -453,9 +453,7 @@ public final class DsCli {
                     probe.command.exit, probeFailure(user, probe.command));
         }
         SessionInfo s = probe.session;
-        List<String> launchArgs = normalizeLaunchArgs(execArgs);
-
-        String inner = systemdLaunchCommand(s, launchArgs, customEnv);
+        String inner = systemdLaunchCommand(s, execArgs, customEnv);
         String b64 = Base64.encodeToString(
                 inner.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         return runSh(name,
@@ -478,29 +476,6 @@ public final class DsCli {
                 r.exit + "): " + detail;
     }
 
-    /** GUI policy for Code only: a launcher must not wait for its window to
-     *  close, and this Anland Xwayland path currently requires software GPU. */
-    static List<String> normalizeLaunchArgs(List<String> execArgs) {
-        String executable = execArgs.get(0);
-        int slash = executable.lastIndexOf('/');
-        if (slash >= 0)
-            executable = executable.substring(slash + 1);
-        if (!"code".equals(executable) && !"code-insiders".equals(executable))
-            return execArgs;
-
-        List<String> out = new ArrayList<>(execArgs.size() + 1);
-        boolean disableGpu = false;
-        for (String arg : execArgs) {
-            if ("--wait".equals(arg))
-                continue;
-            if ("--disable-gpu".equals(arg))
-                disableGpu = true;
-            out.add(arg);
-        }
-        if (!disableGpu)
-            out.add("--disable-gpu");
-        return out;
-    }
     static String systemdLaunchCommand(SessionInfo s, List<String> execArgs,
                                        List<String[]> customEnv) {
         /* env: built-ins < anland-session env (~/.anlandx-env) < user custom;
