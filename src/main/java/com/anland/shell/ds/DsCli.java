@@ -9,6 +9,7 @@ import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * All droidspaces CLI interaction, run as root through {@link RootExec}.
@@ -333,17 +334,41 @@ public final class DsCli {
             "[ -n \"$xa\" ] && echo \"XA=$xa\"\n" +
             "[ -f \"$home/.anlandx-env\" ] && sed \"s/^/E_/\" \"$home/.anlandx-env\"\n";
 
-    /** Probe one explicit user (empty output when the account doesn't exist). */
+    /** Probe one explicit user. Marker output distinguishes a missing account
+     *  from a broken getent/container command without reserving exit codes. */
     private static String userProbe(String user) {
-        return "ent=$(getent passwd " + ShellUtils.shQuote(user) + ") || exit 0\n" +
+        return "command -v getent >/dev/null 2>&1 || { " +
+               "printf '%s\\n' '__ANLAND_PROBE_ERROR__ getent-not-found; exit 72; }\n" +
+               "ent=$(getent passwd " + ShellUtils.shQuote(user) + ")\n" +
+               "rc=$?\n" +
+               "if [ $rc -ne 0 ] || [ -z \"$ent\" ]; then\n" +
+               "  printf '%s\\n' '__ANLAND_USER_MISSING__'\n" +
+               "  exit 0\n" +
                PROBE_EMIT;
     }
 
-    /** Session facts (uid/home/bus/disp/xauth) for one explicit user. */
-    private static SessionInfo probeSession(String name, String user) {
+    /** Parsed session or the exact probe command outcome when no session could
+     *  be produced. The latter is returned intact by launchApp for diagnostics. */
+    private static final class SessionProbe {
+        final SessionInfo session;
+        final RootExec.Result command;
+        final boolean missing;
+
+        SessionProbe(SessionInfo session, RootExec.Result command, boolean missing) {
+            this.session = session;
+            this.command = command;
+            this.missing = missing;
+        }
+    }
+
+    private static SessionProbe probeSession(String name, String user) {
         RootExec.Result r = runSh(name, userProbe(user), 15_000);
         if (!r.ok)
-            return null;
+            return new SessionProbe(null, r, false);
+        if (r.stdout.contains("__ANLAND_PROBE_ERROR__"))
+            return new SessionProbe(null, r, false);
+        if (r.stdout.contains("__ANLAND_USER_MISSING__"))
+            return new SessionProbe(null, r, true);
         SessionInfo s = new SessionInfo();
         for (String line : r.stdout.split("\n")) {
             int eq = line.indexOf('=');
@@ -365,21 +390,17 @@ public final class DsCli {
                 default: break;
             }
         }
-        return s.user == null || s.user.isEmpty() ? null : s;
+        if (s.user == null || s.user.isEmpty() || s.uid == null || s.uid.isEmpty() ||
+                !user.equals(s.user))
+            return new SessionProbe(null, r, false);
+        return new SessionProbe(s, r, false);
     }
 
     /**
-     * Launch an app detached inside the container, as a direct anland client:
-     * XDG_RUNTIME_DIR + WAYLAND_DISPLAY (via the anland session environment
-     * when anland-session runs, built-ins otherwise) plus the kgsl Mesa
-     * overrides. The app runs as the selected launch user (auto = the first
-     * non-root account of the user list) rather than root —
-     * chromium/electron refuse root — and is started THROUGH the systemd user
-     * session (systemd-run --user): anland-session publishes the anland +
-     * mesa environment as the session environment there, the app gets its own
-     * unit under user@&lt;uid&gt;.service/app.slice, and a failed session
-     * start fails the launch loudly. Root launches take the direct detached
-     * path (root has no user session here).
+     * Launch a GUI app through the selected desktop user's systemd manager.
+     * The manager already owns the Anland DISPLAY/Wayland/D-Bus environment;
+     * this entry point never starts GUI processes as UID 0 and never falls
+     * back to a detached root process when the user manager is unavailable.
      */
     public static RootExec.Result launchApp(String name, List<String> execArgs) {
         return launchApp(name, execArgs, "");
@@ -387,13 +408,22 @@ public final class DsCli {
 
     /**
      * @param userOverride "" = auto (first non-root account of the user
-     *        list), "root" = run as root, anything else = that account
+     *        list), "root" = reject GUI launch, anything else = that account
      *        (error when it doesn't exist)
      */
     public static RootExec.Result launchApp(String name, List<String> execArgs,
                                             String userOverride) {
         return launchApp(name, execArgs, userOverride, null);
     }
+    static String launchUserError(String userOverride, String autoUser) {
+        String user = userOverride == null ? "" : userOverride;
+        if ("root".equals(user))
+            return "root cannot launch desktop GUI; choose a non-root user";
+        if (user.isEmpty() && (autoUser == null || autoUser.isEmpty()))
+            return "no non-root desktop user found in container";
+        return null;
+    }
+
 
     /**
      * @param customEnv KEY=VALUE pairs merged over the built-in launch
@@ -403,64 +433,112 @@ public final class DsCli {
     public static RootExec.Result launchApp(String name, List<String> execArgs,
                                             String userOverride,
                                             List<String[]> customEnv) {
+        if (execArgs == null || execArgs.isEmpty())
+            return new RootExec.Result("", "", -1, "empty app command");
+
         String user = userOverride == null ? "" : userOverride;
+        String auto = user.isEmpty() ? autoUser(name) : "";
+        String userError = launchUserError(user, auto);
+        if (userError != null)
+            return new RootExec.Result("", "", -1, userError);
         if (user.isEmpty())
-            user = autoUser(name);
-        SessionInfo s = null;
-        if (!user.isEmpty() && !"root".equals(user)) {
-            s = probeSession(name, user);
-            if (s == null)
-                return new RootExec.Result("", "", -1,
-                        "user " + user + " not found in container");
+            user = auto;
+
+        SessionProbe probe = probeSession(name, user);
+        if (probe.session == null) {
+            if (probe.missing)
+                return new RootExec.Result(probe.command.stdout, probe.command.stderr,
+                        probe.command.exit, "user " + user + " not found in container");
+            return new RootExec.Result(probe.command.stdout, probe.command.stderr,
+                    probe.command.exit, probeFailure(user, probe.command));
         }
+        SessionInfo s = probe.session;
+        List<String> launchArgs = normalizeLaunchArgs(execArgs);
 
-        /* env: built-ins < anland-session env (~/.anlandx-env) < user custom;
-         * the probed bus/display/xauth assert themselves last */
-        List<String[]> env = EnvVars.merge(defaultEnvPairs(),
-                s == null ? null : s.anlandEnv);
-        env = EnvVars.merge(env, customEnv);
-        StringBuilder envPfx = new StringBuilder(EnvVars.envPrefix(env));
-        if (s != null) {
-            if (s.bus != null)
-                envPfx.append(" DBUS_SESSION_BUS_ADDRESS=").append(ShellUtils.shQuote(s.bus));
-            if (s.disp != null)
-                envPfx.append(" DISPLAY=").append(s.disp);
-            if (s.xa != null)
-                envPfx.append(" XAUTHORITY=").append(ShellUtils.shQuote(s.xa));
-        }
-        StringBuilder cmd = new StringBuilder();
-        for (String a : execArgs)
-            cmd.append(' ').append(ShellUtils.shQuote(a));
-
-        if (s == null || "root".equals(s.user) || "0".equals(s.uid))
-            return runSh(name, "cd ~ 2>/dev/null; nohup " + envPfx + cmd
-                    + " >/dev/null 2>&1 &", 20_000);
-
-        /* through the systemd user session; the login shell supplies
-         * HOME/USER/PATH for the desktop user and the snippet is
-         * base64-wrapped again so nothing needs re-escaping. systemd-run
-         * returns once the unit is started — no detached fallback: a down
-         * user manager must fail the launch, not mask it. */
-        StringBuilder inner = new StringBuilder("cd ~ 2>/dev/null\n");
-        if (s.uid != null && !s.uid.isEmpty())
-            inner.append("export XDG_RUNTIME_DIR=")
-                 .append(ShellUtils.shQuote("/run/user/" + s.uid)).append('\n');
-        if (s.bus != null)
-            inner.append("export DBUS_SESSION_BUS_ADDRESS=")
-                 .append(ShellUtils.shQuote(s.bus)).append('\n');
-        inner.append("systemd-run --user --quiet --collect --unit ")
-             .append(ShellUtils.shQuote(unitName(execArgs)))
-             .append(' ').append(envPfx).append(cmd);
+        String inner = systemdLaunchCommand(s, launchArgs, customEnv);
         String b64 = Base64.encodeToString(
-                inner.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+                inner.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         return runSh(name,
                 "su - " + ShellUtils.shQuote(s.user) +
                 " -c \"$(echo " + b64 + " | base64 -d)\"", 20_000);
     }
 
+    private static String probeFailure(String user, RootExec.Result r) {
+        if (r.error != null)
+            return "failed to probe user " + user + " in container: " + r.error;
+        String detail = r.stderr.trim();
+        if (detail.isEmpty())
+            detail = r.stdout.trim();
+        if (detail.isEmpty())
+            detail = "no probe output";
+        int newline = detail.indexOf('\n');
+        if (newline >= 0)
+            detail = detail.substring(0, newline);
+        return "failed to probe user " + user + " in container (exit " +
+                r.exit + "): " + detail;
+    }
+
+    /** GUI policy for Code only: a launcher must not wait for its window to
+     *  close, and this Anland Xwayland path currently requires software GPU. */
+    static List<String> normalizeLaunchArgs(List<String> execArgs) {
+        String executable = execArgs.get(0);
+        int slash = executable.lastIndexOf('/');
+        if (slash >= 0)
+            executable = executable.substring(slash + 1);
+        if (!"code".equals(executable) && !"code-insiders".equals(executable))
+            return execArgs;
+
+        List<String> out = new ArrayList<>(execArgs.size() + 1);
+        boolean disableGpu = false;
+        for (String arg : execArgs) {
+            if ("--wait".equals(arg))
+                continue;
+            if ("--disable-gpu".equals(arg))
+                disableGpu = true;
+            out.add(arg);
+        }
+        if (!disableGpu)
+            out.add("--disable-gpu");
+        return out;
+    }
+    static String systemdLaunchCommand(SessionInfo s, List<String> execArgs,
+                                       List<String[]> customEnv) {
+        /* env: built-ins < anland-session env (~/.anlandx-env) < user custom;
+         * the probed bus/display/xauth assert themselves last */
+        List<String[]> env = EnvVars.merge(defaultEnvPairs(), s.anlandEnv);
+        env = EnvVars.merge(env, customEnv);
+        StringBuilder envPfx = new StringBuilder(EnvVars.envPrefix(env));
+        if (s.bus != null)
+            envPfx.append(" DBUS_SESSION_BUS_ADDRESS=").append(ShellUtils.shQuote(s.bus));
+        if (s.disp != null)
+            envPfx.append(" DISPLAY=").append(ShellUtils.shQuote(s.disp));
+        if (s.xa != null)
+            envPfx.append(" XAUTHORITY=").append(ShellUtils.shQuote(s.xa));
+        StringBuilder cmd = new StringBuilder();
+        for (String arg : execArgs)
+            cmd.append(' ').append(ShellUtils.shQuote(arg));
+
+        /* The login shell establishes HOME/USER/PATH; explicit runtime/bus
+         * exports let systemd-run find this user's manager even without
+         * pam_systemd. A down manager must fail loudly. */
+        StringBuilder inner = new StringBuilder("cd ~ 2>/dev/null\n");
+        inner.append("export XDG_RUNTIME_DIR=")
+             .append(ShellUtils.shQuote("/run/user/" + s.uid)).append('\n');
+        if (s.bus != null)
+            inner.append("export DBUS_SESSION_BUS_ADDRESS=")
+                 .append(ShellUtils.shQuote(s.bus)).append('\n');
+        inner.append("exec systemd-run --user --quiet --collect ")
+             .append("--property=ExitType=cgroup --unit=")
+             .append(ShellUtils.shQuote(unitName(execArgs)))
+             .append(" -- ").append(envPfx).append(cmd);
+        return inner.toString();
+    }
+
+    /** Process-wide sequence prevents same-millisecond transient-unit clashes. */
+    private static final AtomicLong UNIT_SEQUENCE = new AtomicLong();
     /** A unique, valid transient unit name for a session launch:
-     *  app-&lt;exe&gt;-&lt;millis&gt; (service under app.slice). */
-    private static String unitName(List<String> execArgs) {
+     *  app-&lt;exe&gt;-&lt;millis&gt;-&lt;sequence&gt; (service under app.slice). */
+    static String unitName(List<String> execArgs) {
         String base = "app";
         if (execArgs != null && !execArgs.isEmpty()) {
             String a = execArgs.get(0);
@@ -476,7 +554,8 @@ public final class DsCli {
             if (sb.length() > 0)
                 base = sb.toString();
         }
-        return "app-" + base + "-" + System.currentTimeMillis();
+        return "app-" + base + "-" + System.currentTimeMillis() +
+                "-" + UNIT_SEQUENCE.incrementAndGet();
     }
 
     /** root + regular accounts with a real shell, ordered by uid (root first). */
