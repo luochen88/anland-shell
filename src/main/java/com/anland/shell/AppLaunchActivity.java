@@ -19,9 +19,9 @@ import java.util.List;
 /**
  * Translucent trampoline used by both grid taps and pinned home-screen
  * shortcuts: make sure the container is running (boot + poll if not), then
- * launch the app detached inside it (DsCli.launchApp — nohup, returns
- * immediately, survives this process) and finish. noHistory +
- * excludeFromRecents keep it invisible in the flow.
+ * launch the app inside it (DsCli.launchApp — a systemd-run --user unit,
+ * returns once the unit is started, survives this process) and finish.
+ * noHistory + excludeFromRecents keep it invisible in the flow.
  */
 public final class AppLaunchActivity extends Activity {
 

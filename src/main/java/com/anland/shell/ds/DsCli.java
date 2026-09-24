@@ -9,6 +9,7 @@ import org.json.JSONObject;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * All droidspaces CLI interaction, run as root through {@link RootExec}.
@@ -339,11 +340,29 @@ public final class DsCli {
                PROBE_EMIT;
     }
 
-    /** Session facts (uid/home/bus/disp/xauth) for one explicit user. */
-    private static SessionInfo probeSession(String name, String user) {
+    /** Outcome of probing one launch user: a parsed session, or an error
+     *  message with the underlying probe stderr preserved for diagnostics. */
+    private static final class Probe {
+        final SessionInfo session;
+        final String error;   /* null when the probe succeeded */
+        final String stderr;  /* raw probe stderr (empty on success) */
+        Probe(SessionInfo session, String error, String stderr) {
+            this.session = session;
+            this.error = error;
+            this.stderr = stderr;
+        }
+    }
+
+    /** Session facts (uid/home/bus/disp/xauth) for one explicit user. A
+     *  transport failure (su/container error) is reported with its real exit
+     *  status and stderr — never folded into "user not found". */
+    private static Probe probeSession(String name, String user) {
         RootExec.Result r = runSh(name, userProbe(user), 15_000);
-        if (!r.ok)
-            return null;
+        if (!r.ok) {
+            String why = r.error != null ? r.error
+                    : (r.stderr.trim().isEmpty() ? "exit " + r.exit : r.stderr.trim());
+            return new Probe(null, "probe failed: " + why, r.stderr);
+        }
         SessionInfo s = new SessionInfo();
         for (String line : r.stdout.split("\n")) {
             int eq = line.indexOf('=');
@@ -365,7 +384,9 @@ public final class DsCli {
                 default: break;
             }
         }
-        return s.user == null || s.user.isEmpty() ? null : s;
+        if (s.user == null || s.user.isEmpty())
+            return new Probe(null, "user " + user + " not found in container", r.stderr);
+        return new Probe(s, null, "");
     }
 
     /**
@@ -374,12 +395,13 @@ public final class DsCli {
      * when anland-session runs, built-ins otherwise) plus the kgsl Mesa
      * overrides. The app runs as the selected launch user (auto = the first
      * non-root account of the user list) rather than root —
-     * chromium/electron refuse root — and is started THROUGH the systemd user
-     * session (systemd-run --user): anland-session publishes the anland +
-     * mesa environment as the session environment there, the app gets its own
-     * unit under user@&lt;uid&gt;.service/app.slice, and a failed session
-     * start fails the launch loudly. Root launches take the direct detached
-     * path (root has no user session here).
+     * chromium/electron refuse root — and is ALWAYS started through the
+     * systemd user session (systemd-run --user): anland-session publishes
+     * the anland + mesa environment as the session environment there, the
+     * app gets its own unit under user@&lt;uid&gt;.service/app.slice, and a
+     * failed session start fails the launch loudly. Root is never used to run
+     * a desktop GUI directly — a "root" override is handed off to the first
+     * non-root account (and refused when none exists).
      */
     public static RootExec.Result launchApp(String name, List<String> execArgs) {
         return launchApp(name, execArgs, "");
@@ -387,8 +409,9 @@ public final class DsCli {
 
     /**
      * @param userOverride "" = auto (first non-root account of the user
-     *        list), "root" = run as root, anything else = that account
-     *        (error when it doesn't exist)
+     *        list), "root" = the desktop user too (root never runs desktop
+     *        GUI — it is converted to the first non-root account),
+     *        anything else = that account (error when it doesn't exist)
      */
     public static RootExec.Result launchApp(String name, List<String> execArgs,
                                             String userOverride) {
@@ -406,41 +429,43 @@ public final class DsCli {
         String user = userOverride == null ? "" : userOverride;
         if (user.isEmpty())
             user = autoUser(name);
-        SessionInfo s = null;
-        if (!user.isEmpty() && !"root".equals(user)) {
-            s = probeSession(name, user);
-            if (s == null)
-                return new RootExec.Result("", "", -1,
-                        "user " + user + " not found in container");
-        }
+        /* Root must not run a desktop GUI directly (its HOME/XDG_RUNTIME_DIR/
+         * D-Bus differ from the graphical session, so windows would never
+         * appear) — hand off to the container's desktop user, and refuse when
+         * there is no non-root account to hand off to. */
+        if ("root".equals(user))
+            user = autoUser(name);
+        if (user.isEmpty())
+            return new RootExec.Result("", "", -1,
+                    "no non-root desktop user in container to launch GUI as");
+
+        Probe p = probeSession(name, user);
+        if (p.error != null)
+            return new RootExec.Result("", p.stderr, -1, p.error);
+        SessionInfo s = p.session;
 
         /* env: built-ins < anland-session env (~/.anlandx-env) < user custom;
          * the probed bus/display/xauth assert themselves last */
-        List<String[]> env = EnvVars.merge(defaultEnvPairs(),
-                s == null ? null : s.anlandEnv);
+        List<String[]> env = EnvVars.merge(defaultEnvPairs(), s.anlandEnv);
         env = EnvVars.merge(env, customEnv);
         StringBuilder envPfx = new StringBuilder(EnvVars.envPrefix(env));
-        if (s != null) {
-            if (s.bus != null)
-                envPfx.append(" DBUS_SESSION_BUS_ADDRESS=").append(ShellUtils.shQuote(s.bus));
-            if (s.disp != null)
-                envPfx.append(" DISPLAY=").append(s.disp);
-            if (s.xa != null)
-                envPfx.append(" XAUTHORITY=").append(ShellUtils.shQuote(s.xa));
-        }
+        if (s.bus != null)
+            envPfx.append(" DBUS_SESSION_BUS_ADDRESS=").append(ShellUtils.shQuote(s.bus));
+        if (s.disp != null)
+            envPfx.append(" DISPLAY=").append(s.disp);
+        if (s.xa != null)
+            envPfx.append(" XAUTHORITY=").append(ShellUtils.shQuote(s.xa));
         StringBuilder cmd = new StringBuilder();
         for (String a : execArgs)
             cmd.append(' ').append(ShellUtils.shQuote(a));
-
-        if (s == null || "root".equals(s.user) || "0".equals(s.uid))
-            return runSh(name, "cd ~ 2>/dev/null; nohup " + envPfx + cmd
-                    + " >/dev/null 2>&1 &", 20_000);
 
         /* through the systemd user session; the login shell supplies
          * HOME/USER/PATH for the desktop user and the snippet is
          * base64-wrapped again so nothing needs re-escaping. systemd-run
          * returns once the unit is started — no detached fallback: a down
-         * user manager must fail the launch, not mask it. */
+         * user manager must fail the launch, not mask it. ExitType=cgroup
+         * keeps the unit alive while any child of an Electron-style
+         * multi-process app is running; --collect reaps it afterwards. */
         StringBuilder inner = new StringBuilder("cd ~ 2>/dev/null\n");
         if (s.uid != null && !s.uid.isEmpty())
             inner.append("export XDG_RUNTIME_DIR=")
@@ -448,7 +473,8 @@ public final class DsCli {
         if (s.bus != null)
             inner.append("export DBUS_SESSION_BUS_ADDRESS=")
                  .append(ShellUtils.shQuote(s.bus)).append('\n');
-        inner.append("systemd-run --user --quiet --collect --unit ")
+        inner.append("systemd-run --user --quiet --collect ")
+             .append("--property=ExitType=cgroup --unit ")
              .append(ShellUtils.shQuote(unitName(execArgs)))
              .append(' ').append(envPfx).append(cmd);
         String b64 = Base64.encodeToString(
@@ -458,8 +484,12 @@ public final class DsCli {
                 " -c \"$(echo " + b64 + " | base64 -d)\"", 20_000);
     }
 
+    /** Process-wide monotonic counter appended to unit names so two launches
+     *  landing in the same millisecond never collide. */
+    private static final AtomicLong UNIT_SEQ = new AtomicLong();
+
     /** A unique, valid transient unit name for a session launch:
-     *  app-&lt;exe&gt;-&lt;millis&gt; (service under app.slice). */
+     *  app-&lt;exe&gt;-&lt;millis&gt;-&lt;seq&gt; (service under app.slice). */
     private static String unitName(List<String> execArgs) {
         String base = "app";
         if (execArgs != null && !execArgs.isEmpty()) {
@@ -476,7 +506,8 @@ public final class DsCli {
             if (sb.length() > 0)
                 base = sb.toString();
         }
-        return "app-" + base + "-" + System.currentTimeMillis();
+        return "app-" + base + "-" + System.currentTimeMillis() +
+                "-" + UNIT_SEQ.incrementAndGet();
     }
 
     /** root + regular accounts with a real shell, ordered by uid (root first). */
