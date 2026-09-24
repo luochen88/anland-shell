@@ -317,7 +317,7 @@ public final class ShellActivity extends Activity
     private void detectAnlandx(final String container) {
         final String user = Prefs.launchUser(this, container);
         RootExec.POOL.execute(() -> {
-            final boolean installed = DsCli.anlandxInstalled(container, user);
+            final Boolean installed = DsCli.anlandxInstalled(container, user);
             main.post(() -> {
                 if (container.equals(Prefs.activeContainer(this))) {
                     anlandxInstalled = installed;

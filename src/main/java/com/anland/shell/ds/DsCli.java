@@ -336,14 +336,15 @@ public final class DsCli {
 
     /** Probe one explicit user. Marker output distinguishes a missing account
      *  from a broken getent/container command without reserving exit codes. */
-    private static String userProbe(String user) {
+    static String userProbe(String user) {
         return "command -v getent >/dev/null 2>&1 || { " +
-               "printf '%s\\n' '__ANLAND_PROBE_ERROR__ getent-not-found; exit 72; }\n" +
+               "printf '%s\\n' '__ANLAND_PROBE_ERROR__:getent-not-found'; exit 72; }\n" +
                "ent=$(getent passwd " + ShellUtils.shQuote(user) + ")\n" +
                "rc=$?\n" +
                "if [ $rc -ne 0 ] || [ -z \"$ent\" ]; then\n" +
                "  printf '%s\\n' '__ANLAND_USER_MISSING__'\n" +
                "  exit 0\n" +
+               "fi\n" +
                PROBE_EMIT;
     }
 
@@ -571,23 +572,35 @@ public final class DsCli {
         return "";
     }
 
-    /** Whether the Anland session (rootless Xwayland + mini-wm) is available
-     *  for the launch user. The native package installs it in /usr/bin;
-     *  older source-tarball installs used ~/.local/bin/anland-session (or
-     *  the legacy anlandx-start). user "" = auto ({@link #autoUser}). */
-    public static boolean anlandxInstalled(String name, String user) {
+    static String anlandxProbe(String user) {
+        return "ent=$(getent passwd " + ShellUtils.shQuote(user) + ")\n" +
+               "[ -n \"$ent\" ] || { printf '%s\\n' '__ANLANDX_UNKNOWN__'; exit 0; }\n" +
+               "home=$(printf '%s\\n' \"$ent\" | cut -d: -f6)\n" +
+               "if [ -x /usr/bin/anland-session ] || " +
+               "[ -x \"$home/.local/bin/anland-session\" ] || " +
+               "[ -x \"$home/.local/bin/anlandx-start\" ]; then\n" +
+               "  printf '%s\\n' '__ANLANDX_INSTALLED__'\n" +
+               "else\n" +
+               "  printf '%s\\n' '__ANLANDX_MISSING__'\n" +
+               "fi\n";
+    }
+
+    /** Whether the Anland session launcher is installed for the launch user.
+     *  Returns null when the container/user probe itself failed, so the UI
+     *  does not misreport a transient detection failure as "not installed". */
+    public static Boolean anlandxInstalled(String name, String user) {
         if (user == null || user.isEmpty())
             user = autoUser(name);
         if (user.isEmpty())
+            return null;
+        RootExec.Result r = runSh(name, anlandxProbe(user), 15_000);
+        if (!r.ok || r.stdout.contains("__ANLANDX_UNKNOWN__"))
+            return null;
+        if (r.stdout.contains("__ANLANDX_INSTALLED__"))
+            return true;
+        if (r.stdout.contains("__ANLANDX_MISSING__"))
             return false;
-        RootExec.Result r = runSh(name,
-                "home=$(getent passwd " + ShellUtils.shQuote(user) +
-                " | cut -d: -f6)\n" +
-                "[ -x /usr/bin/anland-session ] || { [ -n \"$home\" ] && " +
-                "{ [ -x \"$home/.local/bin/anland-session\" ] || " +
-                "[ -x \"$home/.local/bin/anlandx-start\" ]; }; }",
-                15_000);
-        return r.ok;
+        return null;
     }
 
     // ---------------------------------------------------------------- console
